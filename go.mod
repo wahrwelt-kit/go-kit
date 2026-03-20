@@ -3,16 +3,16 @@ module github.com/takuya-go-kit/go-kit
 go 1.25.0
 
 require (
-	github.com/takuya-go-kit/go-cachekit v0.2.2
-	github.com/takuya-go-kit/go-httpkit v0.2.1
-	github.com/takuya-go-kit/go-jwtkit v0.2.2
-	github.com/takuya-go-kit/go-logkit v0.2.1
-	github.com/takuya-go-kit/go-pgkit v1.1.2
-	github.com/takuya-go-kit/go-wskit v0.1.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.8.0
+	github.com/takuya-go-kit/go-cachekit v0.3.0
+	github.com/takuya-go-kit/go-httpkit v0.3.0
+	github.com/takuya-go-kit/go-jwtkit v0.3.0
+	github.com/takuya-go-kit/go-logkit v0.3.0
+	github.com/takuya-go-kit/go-pgkit v1.2.0
+	github.com/takuya-go-kit/go-wskit v0.1.1
 )
 
 require (
