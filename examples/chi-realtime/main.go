@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/takuya-go-kit/go-cachekit"
-	"github.com/takuya-go-kit/go-httpkit/httputil/middleware"
-	"github.com/takuya-go-kit/go-logkit"
-	"github.com/takuya-go-kit/go-wskit"
 	"github.com/go-chi/chi/v5"
+	"github.com/wahrwelt-kit/go-cachekit"
+	"github.com/wahrwelt-kit/go-httpkit/httputil/middleware"
+	"github.com/wahrwelt-kit/go-logkit"
+	"github.com/wahrwelt-kit/go-wskit"
 )
 
 func main() {

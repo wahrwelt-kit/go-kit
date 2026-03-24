@@ -10,14 +10,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/takuya-go-kit/go-cachekit"
-	"github.com/takuya-go-kit/go-jwtkit"
-	"github.com/takuya-go-kit/go-logkit"
-	"github.com/takuya-go-kit/go-pgkit/pgutil"
-	"github.com/takuya-go-kit/go-pgkit/postgres"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/wahrwelt-kit/go-cachekit"
+	"github.com/wahrwelt-kit/go-jwtkit"
+	"github.com/wahrwelt-kit/go-logkit"
+	"github.com/wahrwelt-kit/go-pgkit/pgutil"
+	"github.com/wahrwelt-kit/go-pgkit/postgres"
 )
 
 type User struct {
