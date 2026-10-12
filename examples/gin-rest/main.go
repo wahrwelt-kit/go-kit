@@ -2,9 +2,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -59,13 +63,29 @@ func main() {
 	if err != nil {
 		log.Fatal("redis", logkit.Error(err))
 	}
-	defer rdb.Close()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Error("redis close", logkit.Error(err))
+		}
+	}()
 
 	cache := cachekit.New(rdb)
 
+	accessSecret, err := requiredJWTSecret("JWT_ACCESS_SECRET")
+	if err != nil {
+		log.Fatal("jwt configuration", logkit.Error(err))
+	}
+	refreshSecret, err := requiredJWTSecret("JWT_REFRESH_SECRET")
+	if err != nil {
+		log.Fatal("jwt configuration", logkit.Error(err))
+	}
+	if bytes.Equal(accessSecret, refreshSecret) {
+		log.Fatal("jwt configuration", logkit.Error(errors.New("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must differ")))
+	}
+
 	jwtSvc, err := jwtkit.NewJWTService(jwtkit.Config{
-		AccessKeys:  []jwtkit.KeyEntry{{Kid: "1", Secret: []byte(env("JWT_SECRET", "change-me-32-bytes-long-secret!!"))}},
-		RefreshKeys: []jwtkit.KeyEntry{{Kid: "1", Secret: []byte(env("JWT_SECRET", "change-me-32-bytes-long-secret!!"))}},
+		AccessKeys:  []jwtkit.KeyEntry{{Kid: "1", Secret: accessSecret}},
+		RefreshKeys: []jwtkit.KeyEntry{{Kid: "1", Secret: refreshSecret}},
 		AccessTTL:   15 * time.Minute,
 		RefreshTTL:  7 * 24 * time.Hour,
 		Issuer:      "gin-rest",
@@ -79,7 +99,7 @@ func main() {
 	r.Use(ginLogger(log))
 
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		writeJSON(c, http.StatusOK, gin.H{"status": "ok"})
 	})
 
 	r.POST("/auth/login", ginLogin(jwtSvc))
@@ -101,7 +121,9 @@ func main() {
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Error("server shutdown", logkit.Error(err))
+	}
 }
 
 func ginLogger(log logkit.Logger) gin.HandlerFunc {
@@ -123,12 +145,14 @@ func ginJWTAuth(svc *jwtkit.JWTService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw := jwtkit.ExtractRaw(c.Request)
 		if raw == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{errorKey: "missing or invalid token"})
+			c.Abort()
+			writeJSON(c, http.StatusUnauthorized, gin.H{errorKey: "missing or invalid token"})
 			return
 		}
 		claims, err := svc.ValidateAccessToken(c.Request.Context(), raw)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{errorKey: "invalid token"})
+			c.Abort()
+			writeJSON(c, http.StatusUnauthorized, gin.H{errorKey: "invalid token"})
 			return
 		}
 		ctx := jwtkit.ClaimsIntoContext(c.Request.Context(), claims)
@@ -140,24 +164,24 @@ func ginJWTAuth(svc *jwtkit.JWTService) gin.HandlerFunc {
 func ginLogin(jwtSvc *jwtkit.JWTService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			UserID string `json:"user_id" binding:"required"`
-			Role   string `json:"role"    binding:"required"`
+			UserID string `json:"user_id"`
+			Role   string `json:"role"`
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{errorKey: "invalid request body"})
+		if err := decodeJSONBody(c, &req); err != nil || req.UserID == "" || req.Role == "" {
+			writeJSON(c, http.StatusBadRequest, gin.H{errorKey: "invalid request body"})
 			return
 		}
 		uid, err := uuid.Parse(req.UserID)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{errorKey: "invalid user_id"})
+			writeJSON(c, http.StatusBadRequest, gin.H{errorKey: "invalid user_id"})
 			return
 		}
 		pair, err := jwtSvc.GenerateTokenPair(c.Request.Context(), uid, req.Role)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{errorKey: "token generation failed"})
+			writeJSON(c, http.StatusInternalServerError, gin.H{errorKey: "token generation failed"})
 			return
 		}
-		c.JSON(http.StatusOK, pair)
+		writeJSON(c, http.StatusOK, pair)
 	}
 }
 
@@ -165,7 +189,7 @@ func ginGetUser(pool *pgxpool.Pool, cache *cachekit.Cache) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, err := uuid.Parse(c.Param("id"))
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{errorKey: "invalid id"})
+			writeJSON(c, http.StatusBadRequest, gin.H{errorKey: "invalid id"})
 			return
 		}
 		user, loadErr := cachekit.GetOrLoad(cache, c.Request.Context(), fmt.Sprintf("user:%s", id), 5*time.Minute, func(ctx context.Context) (User, error) {
@@ -175,13 +199,13 @@ func ginGetUser(pool *pgxpool.Pool, cache *cachekit.Cache) gin.HandlerFunc {
 		})
 		if loadErr != nil {
 			if pgutil.IsNoRows(loadErr) {
-				c.JSON(http.StatusNotFound, gin.H{errorKey: "user not found"})
+				writeJSON(c, http.StatusNotFound, gin.H{errorKey: "user not found"})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{errorKey: "failed to load user"})
+			writeJSON(c, http.StatusInternalServerError, gin.H{errorKey: "failed to load user"})
 			return
 		}
-		c.JSON(http.StatusOK, user)
+		writeJSON(c, http.StatusOK, user)
 	}
 }
 
@@ -190,4 +214,46 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func requiredJWTSecret(name string) ([]byte, error) {
+	secret := os.Getenv(name)
+	if secret == "" {
+		return nil, fmt.Errorf("%s must be set", name)
+	}
+	if len(secret) < jwtkit.MinSecretLength {
+		return nil, fmt.Errorf("%s must be at least %d bytes", name, jwtkit.MinSecretLength)
+	}
+	return []byte(secret), nil
+}
+
+func decodeJSONBody(c *gin.Context, out any) error {
+	dec := jsontext.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+	if err := json.UnmarshalDecode(dec, out); err != nil {
+		return err
+	}
+	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body contains multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func writeJSON(c *gin.Context, status int, value any) {
+	data, err := json.Marshal(
+		value,
+		jsontext.EscapeForHTML(true),
+		jsontext.EscapeForJS(true),
+		json.FormatNilMapAsNull(true),
+		json.FormatNilSliceAsNull(true),
+	)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Status(status)
+	_, _ = c.Writer.Write(append(data, '\n'))
 }

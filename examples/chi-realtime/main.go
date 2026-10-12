@@ -3,9 +3,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -43,7 +45,11 @@ func main() {
 	if err != nil {
 		log.Fatal("redis", logkit.Error(err))
 	}
-	defer rdb.Close()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Error("redis close", logkit.Error(err))
+		}
+	}()
 
 	hub := wskit.NewHub(
 		// Redis Pub/Sub - enables broadcast across multiple server instances.
@@ -56,9 +62,13 @@ func main() {
 			log.Warn("hub channel timeout", logkit.Fields{"op": op})
 		}),
 		wskit.WithOnConnect(func(s wskit.Subscriber) {
-			data, _ := json.Marshal(wskit.NewEvent("welcome", map[string]string{
+			data, err := json.Marshal(wskit.NewEvent("welcome", map[string]string{
 				"message": "connected to realtime server",
-			}))
+			}), jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true))
+			if err != nil {
+				log.Error("marshal welcome event", logkit.Error(err))
+				return
+			}
 			s.Send(data)
 			log.Debug("subscriber connected", logkit.Component("hub"))
 		}),
@@ -88,8 +98,9 @@ func main() {
 			log.Warn("ws accept failed", logkit.Error(err))
 			return
 		}
-		go client.ReadPump()
+		// ReadPump uses the request context, so keep this handler alive until it returns.
 		go client.WritePump()
+		client.ReadPump()
 	})
 
 	// SSE endpoint - server-to-client only, works through HTTP/1.1 proxies without upgrade.
@@ -106,7 +117,7 @@ func main() {
 			Type    string `json:"type"`
 			Payload any    `json:"payload"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			http.Error(w, "invalid body", http.StatusBadRequest)
 			return
 		}
@@ -118,10 +129,11 @@ func main() {
 	})
 
 	r.Get("/stats", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]int{
+		if err := writeJSON(w, http.StatusOK, map[string]int{
 			"connected_subscribers": hub.SubscriberCount(),
-		})
+		}); err != nil {
+			log.Error("write stats response", logkit.Error(err))
+		}
 	})
 
 	srv := &http.Server{Addr: ":8081", Handler: r}
@@ -138,7 +150,9 @@ func main() {
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Error("server shutdown", logkit.Error(err))
+	}
 }
 
 func env(key, def string) string {
@@ -146,4 +160,35 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, out any) error {
+	dec := jsontext.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := json.UnmarshalDecode(dec, out); err != nil {
+		return err
+	}
+	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body contains multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) error {
+	data, err := json.Marshal(
+		value,
+		jsontext.EscapeForHTML(true),
+		jsontext.EscapeForJS(true),
+		json.FormatNilMapAsNull(true),
+		json.FormatNilSliceAsNull(true),
+	)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, err = w.Write(append(data, '\n'))
+	return err
 }

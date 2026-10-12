@@ -3,9 +3,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,14 +41,22 @@ func main() {
 	if err != nil {
 		log.Fatal("redis", logkit.Error(err))
 	}
-	defer rdb.Close()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Error("redis close", logkit.Error(err))
+		}
+	}()
 
 	hub := wskit.NewHub(
 		wskit.WithRedis(rdb, "ws:events"),
 		wskit.WithOnConnect(func(s wskit.Subscriber) {
-			data, _ := json.Marshal(wskit.NewEvent("welcome", map[string]string{
+			data, err := json.Marshal(wskit.NewEvent("welcome", map[string]string{
 				"message": "connected to realtime server",
-			}))
+			}), jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true))
+			if err != nil {
+				log.Error("marshal welcome event", logkit.Error(err))
+				return
+			}
 			s.Send(data)
 			log.Debug("client connected", logkit.Component("hub"))
 		}),
@@ -64,8 +74,9 @@ func main() {
 			log.Warn("ws accept failed", logkit.Error(err))
 			return
 		}
-		go client.ReadPump()
+		// ReadPump uses the request context, so keep this handler alive until it returns.
 		go client.WritePump()
+		client.ReadPump()
 	})
 
 	r.POST("/broadcast", func(c *gin.Context) {
@@ -73,19 +84,19 @@ func main() {
 			Type    string `json:"type"`
 			Payload any    `json:"payload"`
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		if err := decodeJSONBody(c, &req); err != nil {
+			writeJSON(c, http.StatusBadRequest, gin.H{"error": "invalid body"})
 			return
 		}
 		if err := hub.BroadcastJSON(c.Request.Context(), req.Type, req.Payload); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "broadcast failed"})
+			writeJSON(c, http.StatusInternalServerError, gin.H{"error": "broadcast failed"})
 			return
 		}
 		c.Status(http.StatusNoContent)
 	})
 
 	r.GET("/stats", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
+		writeJSON(c, http.StatusOK, gin.H{
 			"connected_subscribers": hub.SubscriberCount(),
 		})
 	})
@@ -104,7 +115,9 @@ func main() {
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Error("server shutdown", logkit.Error(err))
+	}
 }
 
 func env(key, def string) string {
@@ -112,4 +125,35 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func decodeJSONBody(c *gin.Context, out any) error {
+	dec := jsontext.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+	if err := json.UnmarshalDecode(dec, out); err != nil {
+		return err
+	}
+	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body contains multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func writeJSON(c *gin.Context, status int, value any) {
+	data, err := json.Marshal(
+		value,
+		jsontext.EscapeForHTML(true),
+		jsontext.EscapeForJS(true),
+		json.FormatNilMapAsNull(true),
+		json.FormatNilSliceAsNull(true),
+	)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Status(status)
+	_, _ = c.Writer.Write(append(data, '\n'))
 }

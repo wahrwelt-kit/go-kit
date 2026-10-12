@@ -2,10 +2,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -75,7 +78,11 @@ func main() {
 	if err != nil {
 		log.Fatal("redis", logkit.Error(err))
 	}
-	defer rdb.Close()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Error("redis close", logkit.Error(err))
+		}
+	}()
 
 	cache := cachekit.New(rdb)
 
@@ -91,9 +98,20 @@ func main() {
 		log.Fatal("cached config", logkit.Error(err))
 	}
 
+	accessSecret, err := requiredJWTSecret("JWT_ACCESS_SECRET")
+	if err != nil {
+		log.Fatal("jwt configuration", logkit.Error(err))
+	}
+	refreshSecret, err := requiredJWTSecret("JWT_REFRESH_SECRET")
+	if err != nil {
+		log.Fatal("jwt configuration", logkit.Error(err))
+	}
+	if bytes.Equal(accessSecret, refreshSecret) {
+		log.Fatal("jwt configuration", logkit.Error(errors.New("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must differ")))
+	}
 	jwtSvc, err := jwtkit.NewJWTService(jwtkit.Config{
-		AccessKeys:  []jwtkit.KeyEntry{{Kid: "1", Secret: []byte(env("JWT_SECRET", "change-me-32-bytes-long-secret!!"))}},
-		RefreshKeys: []jwtkit.KeyEntry{{Kid: "1", Secret: []byte(env("JWT_SECRET", "change-me-32-bytes-long-secret!!"))}},
+		AccessKeys:  []jwtkit.KeyEntry{{Kid: "1", Secret: accessSecret}},
+		RefreshKeys: []jwtkit.KeyEntry{{Kid: "1", Secret: refreshSecret}},
 		AccessTTL:   15 * time.Minute,
 		RefreshTTL:  7 * 24 * time.Hour,
 		Issuer:      "chi-rest",
@@ -104,7 +122,9 @@ func main() {
 
 	// i18n bundle - flat JSON format, English default + Spanish.
 	bundle := i18n.NewBundle(language.English)
-	bundle.RegisterUnmarshalFunc("json", json.Unmarshal)
+	bundle.RegisterUnmarshalFunc("json", func(data []byte, v any) error {
+		return json.Unmarshal(data, v)
+	})
 	if _, err = bundle.ParseMessageFileBytes(
 		[]byte(`{"greeting":"Hello","user_not_found":"User not found"}`), "en.json",
 	); err != nil {
@@ -182,7 +202,9 @@ func main() {
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Error("server shutdown", logkit.Error(err))
+	}
 }
 
 func loginHandler(jwtSvc *jwtkit.JWTService) http.HandlerFunc {
@@ -191,7 +213,11 @@ func loginHandler(jwtSvc *jwtkit.JWTService) http.HandlerFunc {
 			UserID string `json:"user_id"`
 			Role   string `json:"role"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
+			httputil.RenderError(w, r, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if req.UserID == "" || req.Role == "" {
 			httputil.RenderError(w, r, http.StatusBadRequest, "invalid request body")
 			return
 		}
@@ -302,4 +328,29 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func requiredJWTSecret(name string) ([]byte, error) {
+	secret := os.Getenv(name)
+	if secret == "" {
+		return nil, fmt.Errorf("%s must be set", name)
+	}
+	if len(secret) < jwtkit.MinSecretLength {
+		return nil, fmt.Errorf("%s must be at least %d bytes", name, jwtkit.MinSecretLength)
+	}
+	return []byte(secret), nil
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, out any) error {
+	dec := jsontext.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := json.UnmarshalDecode(dec, out); err != nil {
+		return err
+	}
+	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body contains multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }

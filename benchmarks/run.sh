@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PARENT_DIR="$(dirname "$SCRIPT_DIR")"
 KITS_DIR="$(dirname "$PARENT_DIR")"
 
+# go-pgkit currently has no Benchmark... functions, so only benchmarked kits run here.
 kits=(go-wskit go-cachekit go-jwtkit go-httpkit go-logkit)
 
 for kit in "${kits[@]}"; do
